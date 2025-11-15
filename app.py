@@ -7,6 +7,7 @@ No system library dependencies (uses h5netcdf instead of netCDF4)
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
+import json
 
 from climate_risk_processor_v4_cloud import ClimateRiskProcessorV4
 
@@ -15,6 +16,17 @@ CORS(app)
 
 # Initialize processor (singleton)
 processor = None
+
+# Load country lookup data
+country_lookup = None
+
+def get_country_lookup():
+    global country_lookup
+    if country_lookup is None:
+        lookup_file = os.path.join(os.path.dirname(__file__), 'country_lookup.json')
+        with open(lookup_file, 'r') as f:
+            country_lookup = json.load(f)
+    return country_lookup
 
 def get_processor():
     global processor
@@ -47,7 +59,8 @@ def home():
             '/': 'GET - API information',
             '/health': 'GET - Health check',
             '/assess': 'POST - Comprehensive climate risk assessment',
-            '/assess/<risk_type>': 'POST - Specific risk type assessment'
+            '/assess/<risk_type>': 'POST - Specific risk type assessment',
+            '/assess/country': 'POST - Country-level risk assessment (population-weighted)'
         },
         'example_request': {
             'url': '/assess',
@@ -186,6 +199,153 @@ def assess_specific_risk(risk_type):
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
+
+@app.route('/assess/country', methods=['POST'])
+def assess_country_risk():
+    """Country-level climate risk assessment using population-weighted coordinates"""
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({'error': 'Request body must be JSON'}), 400
+        
+        if 'country' not in data:
+            return jsonify({'error': 'Missing required parameter: country'}), 400
+        
+        country_name = data['country']
+        asset_value = float(data.get('asset_value', 1000000))
+        building_type = data.get('building_type', 'wood_frame')
+        
+        # Load country lookup
+        lookup = get_country_lookup()
+        
+        # Find country (case-insensitive)
+        country_data = None
+        for key in lookup.keys():
+            if key.lower() == country_name.lower():
+                country_data = lookup[key]
+                country_name = key  # Use canonical name
+                break
+        
+        if not country_data:
+            # Return available countries
+            available = sorted(lookup.keys())
+            return jsonify({
+                'error': f'Country not found: {country_name}',
+                'available_countries': available[:20],  # First 20 as sample
+                'total_countries': len(available)
+            }), 404
+        
+        proc = get_processor()
+        
+        # Calculate risk for population-weighted centroid
+        pop_weighted = country_data['population_weighted']
+        weighted_risk = proc.calculate_comprehensive_risk(
+            pop_weighted['latitude'],
+            pop_weighted['longitude'],
+            asset_value=asset_value,
+            building_type=building_type
+        )
+        
+        # Calculate risk for capital
+        capital = country_data.get('capital')
+        capital_risk = None
+        if capital:
+            capital_risk = proc.calculate_comprehensive_risk(
+                capital['latitude'],
+                capital['longitude'],
+                asset_value=asset_value,
+                building_type=building_type
+            )
+        
+        # Calculate risk for major cities
+        major_cities = country_data.get('major_cities', [])
+        city_risks = []
+        for city in major_cities[:5]:  # Top 5 cities
+            city_result = proc.calculate_comprehensive_risk(
+                city['latitude'],
+                city['longitude'],
+                asset_value=asset_value,
+                building_type=building_type
+            )
+            city_risks.append({
+                'name': city['name'],
+                'coordinates': {
+                    'latitude': city['latitude'],
+                    'longitude': city['longitude']
+                },
+                'population': city['population'],
+                'expected_annual_loss': city_result['expected_annual_loss'],
+                'expected_annual_loss_pct': city_result['expected_annual_loss_pct'],
+                'present_value_30yr': city_result['present_value_30yr'],
+                'risk_breakdown': city_result['risk_breakdown']
+            })
+        
+        # Calculate summary statistics
+        if city_risks:
+            avg_loss_pct = sum(c['expected_annual_loss_pct'] for c in city_risks) / len(city_risks)
+            max_loss_city = max(city_risks, key=lambda c: c['expected_annual_loss_pct'])
+            min_loss_city = min(city_risks, key=lambda c: c['expected_annual_loss_pct'])
+        else:
+            avg_loss_pct = weighted_risk['expected_annual_loss_pct']
+            max_loss_city = None
+            min_loss_city = None
+        
+        # Build response
+        response = {
+            'country': country_name,
+            'asset_value': asset_value,
+            'building_type': building_type,
+            'population_weighted_risk': {
+                'description': 'Risk calculated at population-weighted centroid (where most people live)',
+                'coordinates': {
+                    'latitude': pop_weighted['latitude'],
+                    'longitude': pop_weighted['longitude']
+                },
+                'total_population': pop_weighted['total_population'],
+                'expected_annual_loss': weighted_risk['expected_annual_loss'],
+                'expected_annual_loss_pct': weighted_risk['expected_annual_loss_pct'],
+                'present_value_30yr': weighted_risk['present_value_30yr'],
+                'present_value_30yr_pct': weighted_risk['present_value_30yr_pct'],
+                'risk_breakdown': weighted_risk['risk_breakdown']
+            },
+            'major_cities_analysis': {
+                'description': f'Risk analysis for top {len(city_risks)} cities by population',
+                'cities': city_risks,
+                'summary': {
+                    'average_annual_loss_pct': avg_loss_pct,
+                    'highest_risk_city': max_loss_city['name'] if max_loss_city else None,
+                    'highest_risk_loss_pct': max_loss_city['expected_annual_loss_pct'] if max_loss_city else None,
+                    'lowest_risk_city': min_loss_city['name'] if min_loss_city else None,
+                    'lowest_risk_loss_pct': min_loss_city['expected_annual_loss_pct'] if min_loss_city else None
+                }
+            }
+        }
+        
+        # Add capital risk if available
+        if capital_risk:
+            response['capital_risk'] = {
+                'description': 'Risk calculated at largest city (capital proxy)',
+                'name': capital['name'],
+                'coordinates': {
+                    'latitude': capital['latitude'],
+                    'longitude': capital['longitude']
+                },
+                'population': capital['population'],
+                'expected_annual_loss': capital_risk['expected_annual_loss'],
+                'expected_annual_loss_pct': capital_risk['expected_annual_loss_pct'],
+                'present_value_30yr': capital_risk['present_value_30yr'],
+                'risk_breakdown': capital_risk['risk_breakdown']
+            }
+        
+        return jsonify(response)
+        
+    except ValueError as e:
+        return jsonify({'error': f'Invalid parameter value: {str(e)}'}), 400
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': f'Internal error: {str(e)}'}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
