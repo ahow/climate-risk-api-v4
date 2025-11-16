@@ -346,13 +346,35 @@ class ClimateRiskProcessorV4:
         return None
     
     def query_flood_depth(self, lat, lon):
-        """Query flood depth from pre-computed lookup"""
+        """Query flood depth from pre-computed lookup with nearest neighbor fallback"""
         # Round to nearest 0.5 degrees (same as lookup grid)
         lat_round = round(lat * 2) / 2
         lon_round = round(lon * 2) / 2
         
         key = f"{lat_round},{lon_round}"
-        return self.flood_lookup.get(key, 0.0)
+        
+        # Try exact match first
+        if key in self.flood_lookup:
+            return self.flood_lookup[key]
+        
+        # If no exact match, find nearest neighbor within 2 degrees
+        min_distance = float('inf')
+        nearest_depth = 0.0
+        
+        for lookup_key, depth in self.flood_lookup.items():
+            try:
+                lookup_lat, lookup_lon = map(float, lookup_key.split(','))
+                # Calculate approximate distance in degrees
+                distance = ((lat - lookup_lat)**2 + (lon - lookup_lon)**2)**0.5
+                
+                # Only consider points within 2 degrees (~220km)
+                if distance < 2.0 and distance < min_distance:
+                    min_distance = distance
+                    nearest_depth = depth
+            except:
+                continue
+        
+        return nearest_depth
     
     # ========================================================================
     # CALIBRATED DAMAGE FUNCTIONS
@@ -463,12 +485,13 @@ class ClimateRiskProcessorV4:
                     # Calculate distance
                     distance_km = self.haversine(lat, lon, storm_lat, storm_lon)
                     
-                    # Only consider storms within 100km
-                    if distance_km > 100:
+                    # Only consider storms within 200km (captures regional cyclones)
+                    if distance_km > 200:
                         continue
                     
-                    # Wind decay with distance
-                    decay_factor = max(0, 1 - (distance_km / 100))
+                    # Wind decay with distance (exponential decay)
+                    # At 0km: 100%, at 100km: 50%, at 200km: 25%
+                    decay_factor = max(0, (1 - distance_km / 200) ** 0.5)
                     effective_wind_kt = wind_kt * decay_factor
                     effective_wind_mph = effective_wind_kt * 1.15078
                     
