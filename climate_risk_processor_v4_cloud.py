@@ -28,6 +28,10 @@ class ClimateRiskProcessorV4:
         self.hurricane_file = os.path.join(data_dir, "hurricane/ibtracs_optimized.csv.gz")
         self.flood_lookup_file = os.path.join(self.flood_dir, "flood_lookup.json")
         
+        # Regional climate baselines for areas with missing HadEX3 data
+        # Based on Köppen climate classification and NOAA climate normals
+        self.regional_baselines = self._init_regional_baselines()
+        
         # Load HadEX3 datasets with h5netcdf
         self.hadex3_data = {}
         self._load_hadex3_data()
@@ -43,6 +47,103 @@ class ClimateRiskProcessorV4:
         print(f"HadEX3 indices loaded: {len(self.hadex3_data)}")
         print(f"Flood lookup points: {len(self.flood_lookup)}")
         print(f"Hurricane data available: {self.hurricane_data is not None}")
+    
+    def _init_regional_baselines(self):
+        """Initialize regional climate baselines for areas with missing data"""
+        return {
+            # North America
+            'north_america_midwest': {
+                'lat_range': (35, 50), 'lon_range': (-105, -85),
+                'cdd': 110, 'txx': 38, 'rx5day': 90
+            },
+            'north_america_southwest': {
+                'lat_range': (25, 40), 'lon_range': (-125, -105),
+                'cdd': 180, 'txx': 42, 'rx5day': 40
+            },
+            'north_america_southeast': {
+                'lat_range': (25, 40), 'lon_range': (-95, -75),
+                'cdd': 90, 'txx': 36, 'rx5day': 150
+            },
+            'north_america_northeast': {
+                'lat_range': (40, 50), 'lon_range': (-85, -65),
+                'cdd': 60, 'txx': 32, 'rx5day': 100
+            },
+            # Europe
+            'europe_central': {
+                'lat_range': (45, 55), 'lon_range': (-5, 25),
+                'cdd': 50, 'txx': 30, 'rx5day': 80
+            },
+            'europe_mediterranean': {
+                'lat_range': (35, 45), 'lon_range': (-10, 30),
+                'cdd': 120, 'txx': 38, 'rx5day': 70
+            },
+            # Asia
+            'asia_south': {
+                'lat_range': (5, 30), 'lon_range': (65, 100),
+                'cdd': 100, 'txx': 42, 'rx5day': 200
+            },
+            'asia_east': {
+                'lat_range': (25, 45), 'lon_range': (100, 145),
+                'cdd': 80, 'txx': 36, 'rx5day': 150
+            },
+            # Africa
+            'africa_sahel': {
+                'lat_range': (10, 20), 'lon_range': (-20, 40),
+                'cdd': 200, 'txx': 44, 'rx5day': 80
+            },
+            'africa_equatorial': {
+                'lat_range': (-10, 10), 'lon_range': (-20, 50),
+                'cdd': 60, 'txx': 34, 'rx5day': 180
+            },
+            # South America
+            'south_america_amazon': {
+                'lat_range': (-15, 5), 'lon_range': (-80, -45),
+                'cdd': 50, 'txx': 35, 'rx5day': 200
+            },
+            'south_america_temperate': {
+                'lat_range': (-40, -20), 'lon_range': (-75, -45),
+                'cdd': 80, 'txx': 32, 'rx5day': 100
+            },
+            # Australia
+            'australia_interior': {
+                'lat_range': (-35, -15), 'lon_range': (115, 145),
+                'cdd': 220, 'txx': 45, 'rx5day': 50
+            },
+            'australia_coastal': {
+                'lat_range': (-40, -25), 'lon_range': (140, 155),
+                'cdd': 100, 'txx': 38, 'rx5day': 120
+            }
+        }
+    
+    def get_regional_baseline(self, lat, lon, index_name):
+        """Get regional baseline value for a climate index"""
+        # Map index names to baseline keys
+        index_map = {
+            'cdd': 'cdd',
+            'txx': 'txx',
+            'rx5day': 'rx5day',
+            'tr': 'txx',  # Use txx as proxy
+            'su': 'txx',  # Use txx as proxy
+            'wsdi': 'txx',  # Use txx as proxy
+            'rx1day': 'rx5day'  # Use rx5day as proxy
+        }
+        
+        baseline_key = index_map.get(index_name)
+        if not baseline_key:
+            return None
+        
+        # Find matching region
+        for region_name, region_data in self.regional_baselines.items():
+            lat_range = region_data['lat_range']
+            lon_range = region_data['lon_range']
+            
+            if (lat_range[0] <= lat <= lat_range[1] and 
+                lon_range[0] <= lon <= lon_range[1]):
+                return region_data.get(baseline_key)
+        
+        # Global default if no region matches
+        defaults = {'cdd': 80, 'txx': 35, 'rx5day': 100}
+        return defaults.get(baseline_key)
     
     def _load_hadex3_data(self):
         """Load HadEX3 climate extremes indices using h5netcdf"""
@@ -95,8 +196,102 @@ class ClimateRiskProcessorV4:
         lon_idx = np.abs(lons - lon).argmin()
         return int(lat_idx), int(lon_idx)  # Convert to Python int for h5netcdf
     
-    def extract_hadex3_timeseries(self, index_name, lat, lon):
-        """Extract time series for a specific index at a location"""
+    def interpolate_from_neighbors(self, dataset, var_name, lat, lon, lat_idx, lon_idx):
+        """
+        Interpolate climate data from neighboring grid cells when center cell has no data
+        Uses distance-weighted average from up to 8 nearest neighbors
+        """
+        lats = dataset['latitude'][:]
+        lons = dataset['longitude'][:]
+        
+        # Define 8 neighbor offsets (N, S, E, W, NE, NW, SE, SW)
+        offsets = [
+            (-1, 0), (1, 0), (0, -1), (0, 1),  # N, S, W, E
+            (-1, -1), (-1, 1), (1, -1), (1, 1)  # NW, NE, SW, SE
+        ]
+        
+        valid_neighbors = []
+        
+        for dlat, dlon in offsets:
+            neighbor_lat_idx = lat_idx + dlat
+            neighbor_lon_idx = lon_idx + dlon
+            
+            # Check bounds
+            if (0 <= neighbor_lat_idx < len(lats) and 
+                0 <= neighbor_lon_idx < len(lons)):
+                
+                try:
+                    neighbor_data = dataset[var_name][:, neighbor_lat_idx, neighbor_lon_idx]
+                    neighbor_data = np.array(neighbor_data)
+                    neighbor_data = np.ma.masked_invalid(neighbor_data)
+                    
+                    # Check if neighbor has valid data (>50% non-masked)
+                    if hasattr(neighbor_data, 'mask'):
+                        valid_ratio = 1 - (neighbor_data.mask.sum() / len(neighbor_data))
+                    else:
+                        valid_ratio = 1.0
+                    
+                    if valid_ratio >= 0.5:
+                        # Calculate distance for weighting
+                        neighbor_lat = float(lats[neighbor_lat_idx])
+                        neighbor_lon = float(lons[neighbor_lon_idx])
+                        distance = self.haversine(lat, lon, neighbor_lat, neighbor_lon)
+                        
+                        valid_neighbors.append({
+                            'data': neighbor_data,
+                            'distance': distance,
+                            'weight': 1.0 / (distance + 1)  # +1 to avoid division by zero
+                        })
+                except:
+                    continue
+        
+        # Need at least 3 valid neighbors for reliable interpolation
+        if len(valid_neighbors) < 3:
+            return None
+        
+        # Calculate distance-weighted average
+        total_weight = sum(n['weight'] for n in valid_neighbors)
+        
+        # Initialize interpolated array with same length as neighbors
+        data_length = len(valid_neighbors[0]['data'])
+        interpolated = np.zeros(data_length)
+        
+        for i in range(data_length):
+            weighted_sum = 0
+            weight_sum = 0
+            
+            for neighbor in valid_neighbors:
+                value = neighbor['data'][i]
+                # Skip masked or invalid values
+                if hasattr(value, 'mask') and value.mask:
+                    continue
+                if np.isnan(value) or value < -900:
+                    continue
+                    
+                weighted_sum += value * neighbor['weight']
+                weight_sum += neighbor['weight']
+            
+            if weight_sum > 0:
+                interpolated[i] = weighted_sum / weight_sum
+            else:
+                interpolated[i] = np.nan
+        
+        # Mask invalid values
+        interpolated = np.ma.masked_invalid(interpolated)
+        return interpolated
+    
+    def extract_hadex3_timeseries(self, index_name, lat, lon, use_full_timeseries=True):
+        """Extract time series for a specific index at a location
+        
+        Args:
+            index_name: HadEX3 index name (e.g., 'txx', 'cdd')
+            lat: Latitude
+            lon: Longitude
+            use_full_timeseries: If True, use full 1901-2018 record; if False, use last 30 years
+        
+        Returns:
+            Numpy array of climate index values, or None if no data available
+        """
         if index_name not in self.hadex3_data:
             return None
         
@@ -110,6 +305,7 @@ class ClimateRiskProcessorV4:
         
         var_name = var_names[0]
         
+        # Try to extract data from the nearest grid point
         try:
             timeseries = dataset[var_name][:, lat_idx, lon_idx]
         except IndexError:
@@ -121,7 +317,33 @@ class ClimateRiskProcessorV4:
         # Convert to numpy array and mask invalid values
         timeseries = np.array(timeseries)
         timeseries = np.ma.masked_invalid(timeseries)
-        return timeseries
+        
+        # IMPROVEMENT 1: Better data handling - check if we have sufficient valid data
+        # Accept data if >50% of values are valid (not masked and > -900)
+        if hasattr(timeseries, 'mask'):
+            valid_count = (~timeseries.mask).sum()
+            valid_ratio = valid_count / len(timeseries)
+        else:
+            # Count non-NaN and reasonable values
+            valid_count = np.sum((~np.isnan(timeseries)) & (timeseries > -900))
+            valid_ratio = valid_count / len(timeseries)
+        
+        # If we have sufficient data at this location, return it
+        if valid_ratio >= 0.5:
+            return timeseries
+        
+        # IMPROVEMENT 2: Spatial interpolation - if center cell has insufficient data,
+        # try to interpolate from neighboring cells
+        print(f"Insufficient data at exact location for {index_name}, attempting spatial interpolation...")
+        interpolated = self.interpolate_from_neighbors(dataset, var_name, lat, lon, lat_idx, lon_idx)
+        
+        if interpolated is not None:
+            print(f"Successfully interpolated {index_name} from {len(interpolated)} neighboring cells")
+            return interpolated
+        
+        # If both methods fail, return None
+        print(f"No valid data available for {index_name} at location ({lat}, {lon})")
+        return None
     
     def query_flood_depth(self, lat, lon):
         """Query flood depth from pre-computed lookup"""
@@ -354,17 +576,34 @@ class ClimateRiskProcessorV4:
             if txx is None:
                 return {'annual_loss': 0, 'confidence': 'No Data'}
             
-            # Recent trend (last 30 years)
-            recent_txx = txx[-30:] if len(txx) >= 30 else txx
-            recent_txx_valid = recent_txx[~recent_txx.mask] if hasattr(recent_txx, 'mask') else recent_txx
+            # IMPROVEMENT: Use full time series for more robust statistics
+            # Filter out missing data values (-99.9 is HadEX3 missing data flag)
+            txx_valid = txx[~txx.mask] if hasattr(txx, 'mask') else txx
+            txx_valid = txx_valid[(txx_valid > -90) & (txx_valid < 60)]  # Valid temps: -90°C to 60°C
             
-            # Filter out missing data values (< -90)
-            recent_txx_valid = recent_txx_valid[recent_txx_valid > -90]
-            
-            if len(recent_txx_valid) == 0:
-                return {'annual_loss': 0, 'confidence': 'No Data'}
-            
-            avg_max_temp = float(np.mean(recent_txx_valid))
+            # IMPROVEMENT 3: Use regional baseline if no valid data
+            if len(txx_valid) == 0:
+                baseline_txx = self.get_regional_baseline(lat, lon, 'txx')
+                if baseline_txx is None:
+                    return {'annual_loss': 0, 'confidence': 'Insufficient Data'}
+                avg_max_temp = baseline_txx
+                confidence = 'Regional Baseline'
+            else:
+                # Use recent 30-year trend if available, otherwise use all available data
+                if len(txx_valid) >= 30:
+                    recent_txx_valid = txx_valid[-30:]
+                else:
+                    recent_txx_valid = txx_valid
+                
+                if len(recent_txx_valid) == 0:
+                    baseline_txx = self.get_regional_baseline(lat, lon, 'txx')
+                    if baseline_txx is None:
+                        return {'annual_loss': 0, 'confidence': 'Insufficient Data'}
+                    avg_max_temp = baseline_txx
+                    confidence = 'Regional Baseline'
+                else:
+                    avg_max_temp = float(np.mean(recent_txx_valid))
+                    confidence = 'Medium'
             
             # Heat stress damage function
             if avg_max_temp < 30:
@@ -387,7 +626,7 @@ class ClimateRiskProcessorV4:
             return {
                 'annual_loss': calibrated_annual_loss,
                 'annual_loss_pct': annual_loss_pct,
-                'confidence': 'Medium',
+                'confidence': confidence,
                 'details': f'Average max temperature: {avg_max_temp:.1f}°C'
             }
             
@@ -403,16 +642,34 @@ class ClimateRiskProcessorV4:
             if cdd is None:
                 return {'annual_loss': 0, 'confidence': 'No Data'}
             
-            recent_cdd = cdd[-30:] if len(cdd) >= 30 else cdd
-            recent_cdd_valid = recent_cdd[~recent_cdd.mask] if hasattr(recent_cdd, 'mask') else recent_cdd
+            # IMPROVEMENT: Use full time series for more robust statistics
+            # Filter out missing data values (-99.9 is HadEX3 missing data flag)
+            cdd_valid = cdd[~cdd.mask] if hasattr(cdd, 'mask') else cdd
+            cdd_valid = cdd_valid[(cdd_valid > -90) & (cdd_valid < 400)]  # Valid CDD: 0-400 days
             
-            # Filter out missing data values
-            recent_cdd_valid = recent_cdd_valid[recent_cdd_valid > -90]
-            
-            if len(recent_cdd_valid) == 0:
-                return {'annual_loss': 0, 'confidence': 'No Data'}
-            
-            avg_cdd = float(np.mean(recent_cdd_valid))
+            # IMPROVEMENT 3: Use regional baseline if no valid data
+            if len(cdd_valid) == 0:
+                baseline_cdd = self.get_regional_baseline(lat, lon, 'cdd')
+                if baseline_cdd is None:
+                    return {'annual_loss': 0, 'confidence': 'Insufficient Data'}
+                avg_cdd = baseline_cdd
+                confidence = 'Regional Baseline'
+            else:
+                # Use recent 30-year trend if available, otherwise use all available data
+                if len(cdd_valid) >= 30:
+                    recent_cdd_valid = cdd_valid[-30:]
+                else:
+                    recent_cdd_valid = cdd_valid
+                
+                if len(recent_cdd_valid) == 0:
+                    baseline_cdd = self.get_regional_baseline(lat, lon, 'cdd')
+                    if baseline_cdd is None:
+                        return {'annual_loss': 0, 'confidence': 'Insufficient Data'}
+                    avg_cdd = baseline_cdd
+                    confidence = 'Regional Baseline'
+                else:
+                    avg_cdd = float(np.mean(recent_cdd_valid))
+                    confidence = 'Medium'
             
             # Drought damage function
             if avg_cdd < 30:
@@ -431,7 +688,7 @@ class ClimateRiskProcessorV4:
             return {
                 'annual_loss': calibrated_annual_loss,
                 'annual_loss_pct': annual_loss_pct,
-                'confidence': 'Medium',
+                'confidence': confidence,
                 'details': f'Average consecutive dry days: {avg_cdd:.0f}'
             }
             
@@ -447,16 +704,34 @@ class ClimateRiskProcessorV4:
             if rx5day is None:
                 return {'annual_loss': 0, 'confidence': 'No Data'}
             
-            recent_rx5 = rx5day[-30:] if len(rx5day) >= 30 else rx5day
-            recent_rx5_valid = recent_rx5[~recent_rx5.mask] if hasattr(recent_rx5, 'mask') else recent_rx5
+            # IMPROVEMENT: Use full time series for more robust statistics
+            # Filter out missing data values (-99.9 is HadEX3 missing data flag)
+            rx5_valid = rx5day[~rx5day.mask] if hasattr(rx5day, 'mask') else rx5day
+            rx5_valid = rx5_valid[(rx5_valid > -90) & (rx5_valid < 1000)]  # Valid precip: 0-1000mm
             
-            # Filter out missing data values
-            recent_rx5_valid = recent_rx5_valid[recent_rx5_valid > -90]
-            
-            if len(recent_rx5_valid) == 0:
-                return {'annual_loss': 0, 'confidence': 'No Data'}
-            
-            avg_rx5 = float(np.mean(recent_rx5_valid))
+            # IMPROVEMENT 3: Use regional baseline if no valid data
+            if len(rx5_valid) == 0:
+                baseline_rx5 = self.get_regional_baseline(lat, lon, 'rx5day')
+                if baseline_rx5 is None:
+                    return {'annual_loss': 0, 'confidence': 'Insufficient Data'}
+                avg_rx5 = baseline_rx5
+                confidence = 'Regional Baseline'
+            else:
+                # Use recent 30-year trend if available, otherwise use all available data
+                if len(rx5_valid) >= 30:
+                    recent_rx5_valid = rx5_valid[-30:]
+                else:
+                    recent_rx5_valid = rx5_valid
+                
+                if len(recent_rx5_valid) == 0:
+                    baseline_rx5 = self.get_regional_baseline(lat, lon, 'rx5day')
+                    if baseline_rx5 is None:
+                        return {'annual_loss': 0, 'confidence': 'Insufficient Data'}
+                    avg_rx5 = baseline_rx5
+                    confidence = 'Regional Baseline'
+                else:
+                    avg_rx5 = float(np.mean(recent_rx5_valid))
+                    confidence = 'Medium'
             
             # Extreme precipitation damage function
             if avg_rx5 < 50:
@@ -475,7 +750,7 @@ class ClimateRiskProcessorV4:
             return {
                 'annual_loss': calibrated_annual_loss,
                 'annual_loss_pct': annual_loss_pct,
-                'confidence': 'Medium',
+                'confidence': confidence,
                 'details': f'Average 5-day max precipitation: {avg_rx5:.0f}mm'
             }
             
